@@ -1,0 +1,119 @@
+name: Build NTgCalls for iOS
+
+# يحاول أولاً تنزيل نسخة iOS الجاهزة من إصدارات pytgcalls/ntgcalls (أسرع بكثير).
+# إن لم توجد، يحاول البناء من المصدر ويسجّل كل خطوة. في الحالتين يرفع كل شي (المكتبات + الهيدرات + السجلات)
+# كـ Artifact باسم ntgcalls-ios لنراجعه ونربطه بالأداة.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag أو branch من NTgCalls (فارغ = آخر إصدار)"
+        required: false
+        default: ""
+      force_source:
+        description: "إجبار البناء من المصدر (بطيء)"
+        type: boolean
+        default: false
+
+jobs:
+  ntgcalls:
+    runs-on: macos-14
+    timeout-minutes: 300
+    steps:
+      - name: Find release and iOS assets
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+        run: |
+          mkdir -p out dl
+          if [ -z "$REF" ]; then
+            API="https://api.github.com/repos/pytgcalls/ntgcalls/releases/latest"
+          else
+            API="https://api.github.com/repos/pytgcalls/ntgcalls/releases/tags/$REF"
+          fi
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$API" -o dl/release.json || true
+          python3 - <<'PY'
+          import json
+          out = open("out/release_assets.txt", "w")
+          try:
+              r = json.load(open("dl/release.json"))
+          except Exception as e:
+              out.write("failed to read release.json: %s\n" % e); out.close(); raise SystemExit(0)
+          out.write("release: %s\n" % r.get("tag_name"))
+          urls = []
+          for a in r.get("assets", []):
+              out.write(" - %s (%s bytes)\n" % (a["name"], a["size"]))
+              n = a["name"].lower()
+              if "ios" in n or "xcframework" in n or "apple" in n:
+                  urls.append(a["browser_download_url"])
+          out.close()
+          open("dl/ios_urls.txt", "w").write("\n".join(urls))
+          print("ios assets:", urls)
+          PY
+          if [ -s dl/ios_urls.txt ]; then
+            while read -r u; do [ -n "$u" ] && curl -sSL "$u" -o "dl/$(basename "$u")"; done < dl/ios_urls.txt
+            echo "have_ios=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_ios=false" >> "$GITHUB_OUTPUT"
+          fi
+          ls -la dl
+
+      - name: Unpack downloaded iOS assets
+        if: steps.rel.outputs.have_ios == 'true'
+        run: |
+          mkdir -p out/prebuilt
+          cd dl
+          for f in *.zip; do [ -f "$f" ] && unzip -q -o "$f" -d ../out/prebuilt/ || true; done
+          for f in *.tar.gz *.tgz; do [ -f "$f" ] && tar -xzf "$f" -C ../out/prebuilt/ || true; done
+          cd ..
+          find out/prebuilt -maxdepth 4 | head -80
+
+      - name: Build from source (fallback or forced)
+        if: steps.rel.outputs.have_ios != 'true' || inputs.force_source
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set +e
+          git clone --recursive https://github.com/pytgcalls/ntgcalls.git src
+          cd src
+          [ -n "$REF" ] && git checkout "$REF" && git submodule update --init --recursive
+          python3 -m pip install --upgrade pip setuptools wheel > ../out/pip.log 2>&1
+          [ -f requirements.txt ] && python3 -m pip install -r requirements.txt >> ../out/pip.log 2>&1
+          python3 setup.py --help > ../out/setup_help.txt 2>&1
+          python3 setup.py build_lib --help > ../out/build_lib_help.txt 2>&1
+          # أوامر مرشّحة (لا أعرف بدقة اسم خيار iOS): نجرّبها بالترتيب ونسجّل نتيجة كل واحد
+          for CMD in "build_lib --platform-target ios" "build_lib --platform ios" "build_lib --target ios" "build_lib"; do
+            echo "=== python3 setup.py $CMD ===" | tee -a ../out/build.log
+            python3 setup.py $CMD >> ../out/build.log 2>&1
+            RC=$?
+            echo "exit code: $RC" | tee -a ../out/build.log
+            [ $RC -eq 0 ] && break
+          done
+          exit 0
+
+      - name: Inspect results
+        if: always()
+        run: |
+          {
+            echo "## libraries"
+            find . \( -name "*.a" -o -name "*.dylib" -o -name "*.xcframework" -o -name "*.framework" \) -not -path "./dl/*" 2>/dev/null | head -50
+            echo "## headers"
+            find . -name "ntgcalls*.h" -not -path "./dl/*" 2>/dev/null | head -20
+          } > out/found.txt
+          cat out/found.txt
+          for f in $(grep -E "\.(a|dylib)$" out/found.txt | head -20); do
+            echo "--- $f"; lipo -info "$f" 2>&1; vtool -show-build "$f" 2>&1 | grep -E "platform|minos" | head -3
+          done > out/arch_check.txt 2>&1
+          cat out/arch_check.txt
+          for h in $(grep -E "ntgcalls.*\.h$" out/found.txt | head -5); do mkdir -p out/headers; cp "$h" out/headers/; done
+          for l in $(grep -E "\.(a|dylib)$" out/found.txt | head -5); do mkdir -p out/libs; cp "$l" out/libs/ 2>/dev/null; done
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntgcalls-ios
+          path: out/**
+          if-no-files-found: warn
